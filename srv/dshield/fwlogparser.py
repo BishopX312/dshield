@@ -11,7 +11,7 @@ import syslog
 from time import strptime
 from time import mktime
 from time import time
-from datetime import datetime
+from datetime import datetime, timezone
 from DShield import DshieldSubmit
 
 maxlines=100000;
@@ -22,12 +22,18 @@ def parse(logline,logformat,linere):
     logline=logline.strip("\000")
     m = linere.match(logline)
     if m:
+        # pi covers older (pre 24.04) iptables logs
         if logformat == 'pi':
             logdata['time'] = int(m.group(1))
             fwdata=m.group(2)
+        # AWS is essentially IPtables but only one space after kernel:
         elif logformat == 'aws':
             logdata['time'] = int(m.group(1))
-            fwdata=m.group(2)            
+            fwdata=m.group(2)
+        # iptables is for newer (Ubuntu 24.04) systems
+        elif logformat == 'iptables':
+            logdata['time'] = int(m.group(1))
+            fwdata=m.group(2)                        
         elif logformat == 'generic':
             month = strptime(m.group(1), '%b').tm_mon
             if month == 12 and now.month == 1:
@@ -45,8 +51,9 @@ def parse(logline,logformat,linere):
 
         else:
             d.log("Bad format specified: {}".format(logformat))
-            
         if logdata['time'] > startdate:
+            if debug>0:
+                print("processing ", logdata['time'], startdate)
             parts = fwdata.split()
             logdata['flags'] = ''
             for part in parts:
@@ -79,6 +86,7 @@ def parse(logline,logformat,linere):
 
 # checking if PID in lock file is valid
 def checklock(lockfile):
+    # deepcode ignore MissingClose: Resultant code deletes the file or kills the process.
     fileh = open(lockfile, 'r')
     pid = int(fileh.read())
     try:
@@ -88,15 +96,19 @@ def checklock(lockfile):
         return True
     else:
         sys.exit('PID file found. Am I already running?')
-
+   
 
 
 # define paramters
 logfile = "/var/log/dshield.log"
 piddir="/var/run/dshield/"
+lastdir="/var/tmp/dshield/"
 config = "/etc/dshield.ini"
 startdate = 0
-now = datetime.utcnow()
+if sys.version_info < (3, 12):
+    now = datetime.utcnow()
+else:
+    now = datetime.now(timezone.utc)
 fieldmap = {'SRC': 'sip', 'DST': 'dip', 'PROTO': 'proto', 'TYPE': 'sport',
             'CODE': 'dport', 'SPT': 'sport', 'DPT': 'dport'}
 protomap = {'ICMP': 1, 'IGMP': 2, 'TCP': 6, 'UDP': 17, 'ESP': 50, 'AH': 51, 'ICMPv6': 58}
@@ -124,12 +136,18 @@ try:
 except:
     os.mkdir(piddir)
 
+try:
+    os.stat(lastdir)
+except:
+    os.mkdir(lastdir)
+
 pidfile = piddir+"fwparser.pid"
-lastcount = piddir+"lastfwlog"
-skipvalue = piddir+"skipvalue"
+lastcount = lastdir+"lastfwlog"
+skipvalue = lastdir+"skipvalue"
     
-if os.path.isfile(logfile) is None:
-    sys.exit('Can not find logfile %s ' % logfile)
+if os.path.isfile(logfile) is None or os.path.getsize(logfile) == 0:
+    d.log('Can not find logfile or file is empty %s ' % logfile)
+    sys.exit()
 if os.path.isfile(pidfile):
     checklock(pidfile)
 
@@ -146,11 +164,16 @@ if os.path.isfile(lastcount):
         d.log("New Startdate")
         startdate = 0
     f.close()
+if startdate>10000000000:
+    if debug>0:
+        print("resetting startdate to lower value ",startdate)
+    startdate = 0
 if debug > 0:
     d.log("Startdate %d file %s" % (startdate,lastcount))
 skip=1
 currenttime=round(time())
 d.log("Current Time %s" % (currenttime))
+
 if ( startdate<currenttime-86400):
     startdate=currenttime-86400;
     d.log("Correcting Startdate to %d" % (startdate) )
@@ -158,7 +181,10 @@ if ( startdate<currenttime-86400):
 
 if os.path.isfile(skipvalue):
     f = open(skipvalue, 'r')
-    skip = float(f.readline())
+    try:
+        skip = float(f.readline())
+    except:
+        skip = 1
     f.close()
 if skip<1:
     skip=1
@@ -201,7 +227,7 @@ else:
     d.log("processed %d lines total and %d new lines and ended at %s" % (i, j, lastdate))
 
 f = open(lastcount, 'w')
-f.write(str(lastdate))
+f.write("%.0f" % lastdate)
 f.close()
 if ( j == maxlines ):
     d.log("incrementing skip value from %d" % (skip))
